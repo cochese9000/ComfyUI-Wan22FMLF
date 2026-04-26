@@ -130,6 +130,7 @@ class WanSegmentedGenerator(io.ComfyNode):
             
             # Aggressively free memory before sampling
             del seg_imgs, seg_prompts, segment_blank_latent
+            comfy.model_management.unload_all_models()
             comfy.model_management.soft_empty_cache()
             gc.collect()
             
@@ -158,13 +159,13 @@ class WanSegmentedGenerator(io.ComfyNode):
             latent_segments.append(samples["samples"].cpu())
             
             if decode_latents:
-                decoded_images = vae.decode_tiled(
+                decoded_images = cls.temporal_decode_tiled(
+                    vae,
                     samples["samples"], 
                     tile_x=vae_tile_size // 8, 
                     tile_y=vae_tile_size // 8,
                     overlap=vae_tile_overlap
                 )
-                decoded_images = decoded_images.cpu()
                 decoded_segments.append(decoded_images)
             
             del samples
@@ -201,6 +202,60 @@ class WanSegmentedGenerator(io.ComfyNode):
             final_latent = {"samples": torch.cat(final_latent_chunks, dim=2)}
 
         return (final_video, final_latent)
+
+    @classmethod
+    def temporal_decode_tiled(cls, vae, latents, tile_x, tile_y, overlap, temporal_chunk_size=8, temporal_overlap=3):
+        T = latents.shape[2]
+        if T <= temporal_chunk_size:
+            return vae.decode_tiled(latents, tile_x=tile_x, tile_y=tile_y, overlap=overlap).cpu()
+            
+        final_frames = (T - 1) * 4 + 1
+        step = temporal_chunk_size - temporal_overlap
+        blend_frames = (temporal_overlap - 1) * 4 + 1
+        
+        decoded_video = None
+        weights_video = None
+        
+        for start in range(0, T, step):
+            end = min(T, start + temporal_chunk_size)
+            if start > 0 and end - start < temporal_overlap + 1:
+                start = max(0, end - temporal_chunk_size)
+                
+            chunk_latents = latents[:, :, start:end, :, :]
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
+            
+            print(f"      - Temporal VAE Decoding chunk: latents {start} to {end}...")
+            chunk_decoded = vae.decode_tiled(chunk_latents, tile_x=tile_x, tile_y=tile_y, overlap=overlap).cpu()
+            
+            B, C_frames, H, W, C = chunk_decoded.shape
+            
+            if decoded_video is None:
+                decoded_video = torch.zeros((B, final_frames, H, W, C), dtype=torch.float32)
+                weights_video = torch.zeros((B, final_frames, H, W, 1), dtype=torch.float32)
+                
+            frame_start = start * 4
+            frame_end = frame_start + C_frames
+            
+            window = torch.ones((C_frames, 1, 1, 1), dtype=torch.float32)
+            
+            if start > 0:
+                for f in range(blend_frames):
+                    window[f] = f / (blend_frames - 1)
+            if end < T:
+                for f in range(blend_frames):
+                    window[-(f+1)] = f / (blend_frames - 1)
+                    
+            decoded_video[:, frame_start:frame_end] += chunk_decoded * window
+            weights_video[:, frame_start:frame_end] += window
+            
+            del chunk_decoded, chunk_latents
+            
+            if end == T:
+                break
+                
+        decoded_video = decoded_video / weights_video.clamp(min=1e-6)
+        return decoded_video
 
     @classmethod
     def _build_segment_conditionings(cls, clip, vae, seg_imgs, seg_prompts, negative_prompt, 
@@ -255,40 +310,39 @@ class WanSegmentedGenerator(io.ComfyNode):
         base_cond_latent = torch.zeros(1, latent_channels, latent_t, height // spacial_scale, width // spacial_scale, dtype=encoded_latents[0].dtype, device=device)
         base_cond_latent = comfy.latent_formats.Wan21().process_out(base_cond_latent)
 
-        if mode == "SINGLE_PERSON":
-            concat_latent_image_high = base_cond_latent.clone()
-            if n_imgs >= 1:
-                latent_idx_first = int(aligned_positions[0]) // 4
-                concat_latent_image_high[:, :, latent_idx_first:latent_idx_first+1] = encoded_latents[0]
-            if n_imgs >= 2:
-                for i in range(1, n_imgs - 1):
-                    latent_idx_mid = int(aligned_positions[i]) // 4
-                    concat_latent_image_high[:, :, latent_idx_mid:latent_idx_mid+1] = encoded_latents[i]
-                concat_latent_image_high[:, :, -1:] = encoded_latents[-1]
-        else:
-            need_selective_image_high = (ref_strength_high == 0.0) or (end_frame_strength_high == 0.0)
+        curves_list = [p.get("curve", "linear") for p in seg_prompts]
+        
+        def apply_curve(x, curve_type):
+            if curve_type == "ease-in": return x * x
+            if curve_type == "ease-out": return 1.0 - (1.0 - x)*(1.0 - x)
+            if curve_type == "ease-in-out": return x * x * (3.0 - 2.0 * x)
+            return x
 
-            if need_selective_image_high:
-                concat_latent_image_high = base_cond_latent.clone()
-                if n_imgs >= 1:
-                    latent_idx_first = int(aligned_positions[0]) // 4
-                    concat_latent_image_high[:, :, latent_idx_first:latent_idx_first + 1] = encoded_latents[0]
-                if ref_strength_high > 0.0:
-                    for i in range(1, n_imgs - 1):
-                        latent_idx_mid = int(aligned_positions[i]) // 4
-                        concat_latent_image_high[:, :, latent_idx_mid:latent_idx_mid + 1] = encoded_latents[i]
-                if n_imgs >= 2 and end_frame_strength_high > 0.0:
-                    concat_latent_image_high[:, :, -1:] = encoded_latents[-1]
-            else:
-                concat_latent_image_high = base_cond_latent.clone()
-                if n_imgs >= 1:
-                    latent_idx_first = int(aligned_positions[0]) // 4
-                    concat_latent_image_high[:, :, latent_idx_first:latent_idx_first + 1] = encoded_latents[0]
-                if n_imgs >= 2:
-                    for i in range(1, n_imgs - 1):
-                        latent_idx_mid = int(aligned_positions[i]) // 4
-                        concat_latent_image_high[:, :, latent_idx_mid:latent_idx_mid + 1] = encoded_latents[i]
-                    concat_latent_image_high[:, :, -1:] = encoded_latents[-1]
+        concat_latent_image_high = base_cond_latent.clone()
+        
+        if n_imgs >= 2:
+            for i in range(n_imgs - 1):
+                idx_start = int(aligned_positions[i]) // 4
+                idx_end = int(aligned_positions[i+1]) // 4
+                curve_type = curves_list[i] if i < len(curves_list) else "linear"
+                
+                if idx_end > idx_start:
+                    for j in range(idx_start, idx_end + 1):
+                        alpha = (j - idx_start) / (idx_end - idx_start)
+                        alpha = apply_curve(alpha, curve_type)
+                        
+                        blended_latent = encoded_latents[i] * (1.0 - alpha) + encoded_latents[i+1] * alpha
+                        
+                        # Only apply end frame blending fully if strength > 0, else keep it
+                        if i == n_imgs - 2 and j == idx_end and end_frame_strength_high == 0.0:
+                            continue
+                            
+                        concat_latent_image_high[:, :, j:j+1] = blended_latent
+                else:
+                    concat_latent_image_high[:, :, idx_start:idx_start+1] = encoded_latents[i]
+        elif n_imgs == 1:
+            idx_start = int(aligned_positions[0]) // 4
+            concat_latent_image_high[:, :, idx_start:idx_start+1] = encoded_latents[0]
 
         if structural_repulsion_boost > 1.001 and total_length > 4 and n_imgs >= 2:
             mask_h, mask_w = mask_high_noise.shape[-2], mask_high_noise.shape[-1]
@@ -313,25 +367,30 @@ class WanSegmentedGenerator(io.ComfyNode):
                             current_mask = mask_high_noise[:, :, frame_idx, :, :]
                             mask_high_noise[:, :, frame_idx, :, :] = current_mask * spatial_gradient
 
-        if mode == "SINGLE_PERSON":
-            mask_low_noise = mask_base.clone()
-            if n_imgs >= 1: mask_low_noise[:, :, int(aligned_positions[0]):int(aligned_positions[0]) + 4] = 0.0
-            if n_imgs >= 2: mask_low_noise[:, :, -4:] = 1.0 - end_frame_strength_low
-
-            concat_latent_image_low = base_cond_latent.clone()
-            if n_imgs >= 1: concat_latent_image_low[:, :, int(aligned_positions[0]) // 4:int(aligned_positions[0]) // 4 + 1] = encoded_latents[0]
-            if n_imgs >= 2 and end_frame_strength_low > 0.0: concat_latent_image_low[:, :, -1:] = encoded_latents[-1]
-        else:
-            need_selective_image = (ref_strength_low == 0.0) or (end_frame_strength_low == 0.0)
-            concat_latent_image_low = base_cond_latent.clone()
-            if n_imgs >= 1:
-                concat_latent_image_low[:, :, int(aligned_positions[0]) // 4:int(aligned_positions[0]) // 4 + 1] = encoded_latents[0]
-            if n_imgs >= 2:
-                for i in range(1, n_imgs - 1):
-                    if not need_selective_image or ref_strength_low > 0.0:
-                        concat_latent_image_low[:, :, int(aligned_positions[i]) // 4:int(aligned_positions[i]) // 4 + 1] = encoded_latents[i]
-                if not need_selective_image or end_frame_strength_low > 0.0:
-                    concat_latent_image_low[:, :, -1:] = encoded_latents[-1]
+        concat_latent_image_low = base_cond_latent.clone()
+        
+        if n_imgs >= 2:
+            for i in range(n_imgs - 1):
+                idx_start = int(aligned_positions[i]) // 4
+                idx_end = int(aligned_positions[i+1]) // 4
+                curve_type = curves_list[i] if i < len(curves_list) else "linear"
+                
+                if idx_end > idx_start:
+                    for j in range(idx_start, idx_end + 1):
+                        alpha = (j - idx_start) / (idx_end - idx_start)
+                        alpha = apply_curve(alpha, curve_type)
+                        
+                        blended_latent = encoded_latents[i] * (1.0 - alpha) + encoded_latents[i+1] * alpha
+                        
+                        if i == n_imgs - 2 and j == idx_end and end_frame_strength_low == 0.0:
+                            continue
+                            
+                        concat_latent_image_low[:, :, j:j+1] = blended_latent
+                else:
+                    concat_latent_image_low[:, :, idx_start:idx_start+1] = encoded_latents[i]
+        elif n_imgs == 1:
+            idx_start = int(aligned_positions[0]) // 4
+            concat_latent_image_low[:, :, idx_start:idx_start+1] = encoded_latents[0]
 
         mask_high_reshaped = mask_high_noise.view(1, latent_t, 4, mask_high_noise.shape[3], mask_high_noise.shape[4]).transpose(1, 2)
         mask_low_reshaped = mask_low_noise.view(1, latent_t, 4, mask_low_noise.shape[3], mask_low_noise.shape[4]).transpose(1, 2)
@@ -346,7 +405,6 @@ class WanSegmentedGenerator(io.ComfyNode):
         
         positive_high_chunks = []
         positive_low_chunks = []
-        curves_list = [p.get("curve", "linear") for p in seg_prompts]
         
         # Process prompts based on prompt_mode
         if prompt_mode == "first_only (lowest VRAM)" or len(seg_prompts) == 1:
@@ -424,7 +482,7 @@ class WanSegmentedGenerator(io.ComfyNode):
         in_curve = curves[prompt_idx] if prompt_idx > 0 else "linear"
         out_curve = curves[prompt_idx + 1] if prompt_idx < len(pos) - 1 else "linear"
         
-        def apply_curve(x, curve_type):
+        def local_apply_curve(x, curve_type):
             if curve_type == "ease-in": return x * x
             if curve_type == "ease-out": return 1.0 - (1.0 - x)*(1.0 - x)
             if curve_type == "ease-in-out": return x * x * (3.0 - 2.0 * x)
@@ -434,10 +492,10 @@ class WanSegmentedGenerator(io.ComfyNode):
             if i == cur_p:
                 mask[i] = 1.0
             elif prev_p < i < cur_p:
-                val = apply_curve((i - prev_p) / (cur_p - prev_p), in_curve)
+                val = local_apply_curve((i - prev_p) / (cur_p - prev_p), in_curve)
                 mask[i] = val
             elif cur_p < i < next_p:
-                val = apply_curve((i - cur_p) / (next_p - cur_p), out_curve)
+                val = local_apply_curve((i - cur_p) / (next_p - cur_p), out_curve)
                 mask[i] = 1.0 - val
             elif prompt_idx == 0 and i < cur_p:
                 mask[i] = 1.0
