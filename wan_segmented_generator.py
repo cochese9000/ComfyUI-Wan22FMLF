@@ -47,6 +47,7 @@ class WanSegmentedGenerator(io.ComfyNode):
                 io.Latent.Input("base_latent", optional=True),
 
                 # Advanced Wan params
+                io.Combo.Input("prompt_mode", ["temporal_mask (high VRAM)", "average (low VRAM)", "first_only (lowest VRAM)"], default="temporal_mask (high VRAM)", optional=True),
                 io.Combo.Input("mode", ["NORMAL", "SINGLE_PERSON"], default="NORMAL", optional=True),
                 io.Float.Input("ref_strength_high", default=0.8, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
                 io.Float.Input("ref_strength_low", default=0.2, min=0.0, max=1.0, step=0.05, round=0.01, display_mode=io.NumberDisplay.slider, optional=True),
@@ -65,7 +66,7 @@ class WanSegmentedGenerator(io.ComfyNode):
                 width, height, length, seed, steps, cfg, sampler_name, scheduler, 
                 add_noise, start_at_step, end_at_step, return_with_leftover_noise,
                 denoise, vae_tile_size, vae_tile_overlap=16, decode_latents=True, base_latent=None,
-                mode="NORMAL", ref_strength_high=0.8, ref_strength_low=0.2,
+                mode="NORMAL", prompt_mode="temporal_mask (high VRAM)", ref_strength_high=0.8, ref_strength_low=0.2,
                 end_frame_strength_high=1.0, end_frame_strength_low=1.0, structural_repulsion_boost=1.0):
         
         prompts = prompt_batch.copy() if isinstance(prompt_batch, list) else [{"text": "", "curve": "linear"}]
@@ -104,12 +105,13 @@ class WanSegmentedGenerator(io.ComfyNode):
                 seg_imgs=seg_imgs, seg_prompts=seg_prompts,
                 negative_prompt=negative_prompt, 
                 width=width, height=height, length=length,
-                mode=mode, 
+                mode=mode, prompt_mode=prompt_mode,
                 ref_strength_high=ref_strength_high, ref_strength_low=ref_strength_low,
                 end_frame_strength_high=end_frame_strength_high, end_frame_strength_low=end_frame_strength_low,
                 structural_repulsion_boost=structural_repulsion_boost,
                 device=device
             )
+            
             
             segment_seed = seed + i
             
@@ -125,6 +127,11 @@ class WanSegmentedGenerator(io.ComfyNode):
             
             add_noise_str = "enable" if add_noise else "disable"
             return_noise_str = "enable" if return_with_leftover_noise else "disable"
+            
+            # Aggressively free memory before sampling
+            del seg_imgs, seg_prompts, segment_blank_latent
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
             
             samples = ksampler.sample(
                 model=model, 
@@ -143,6 +150,11 @@ class WanSegmentedGenerator(io.ComfyNode):
                 denoise=denoise
             )[0]
             
+            # Free memory after sampling
+            del positive_high, positive_low, negative, segment_latent
+            comfy.model_management.soft_empty_cache()
+            gc.collect()
+            
             latent_segments.append(samples["samples"].cpu())
             
             if decode_latents:
@@ -155,7 +167,7 @@ class WanSegmentedGenerator(io.ComfyNode):
                 decoded_images = decoded_images.cpu()
                 decoded_segments.append(decoded_images)
             
-            del samples, positive_high, positive_low, negative, segment_blank_latent, seg_imgs, seg_prompts, segment_latent
+            del samples
             comfy.model_management.soft_empty_cache()
             gc.collect()
 
@@ -192,7 +204,7 @@ class WanSegmentedGenerator(io.ComfyNode):
 
     @classmethod
     def _build_segment_conditionings(cls, clip, vae, seg_imgs, seg_prompts, negative_prompt, 
-                                     width, height, length, mode, ref_strength_high, ref_strength_low,
+                                     width, height, length, mode, prompt_mode, ref_strength_high, ref_strength_low,
                                      end_frame_strength_high, end_frame_strength_low, structural_repulsion_boost, device):
         
         n_imgs = seg_imgs.shape[0]
@@ -336,26 +348,67 @@ class WanSegmentedGenerator(io.ComfyNode):
         positive_low_chunks = []
         curves_list = [p.get("curve", "linear") for p in seg_prompts]
         
-        for i, prompt_dict in enumerate(seg_prompts):
-            text = prompt_dict.get("text", "")
+        # Process prompts based on prompt_mode
+        if prompt_mode == "first_only (lowest VRAM)" or len(seg_prompts) == 1:
+            text = seg_prompts[0].get("text", "")
             tokens = clip.tokenize(text)
             cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
             
-            t_mask = cls._build_temporal_mask(i, aligned_positions, latent_t, H_latent, W_latent, curves_list, device)
-            t_mask = t_mask.unsqueeze(0)
-            
             cond_high = [[cond, {
-                "mask": t_mask.clone(), 
                 "concat_latent_image": concat_latent_image_high, 
                 "concat_mask": mask_high_reshaped}]]
-                
             cond_low = [[cond, {
-                "mask": t_mask.clone(), 
                 "concat_latent_image": concat_latent_image_low, 
                 "concat_mask": mask_low_reshaped}]]
                 
             positive_high_chunks.extend(cond_high)
             positive_low_chunks.extend(cond_low)
+            
+        elif prompt_mode == "average (low VRAM)":
+            text1 = seg_prompts[0].get("text", "")
+            text2 = seg_prompts[1].get("text", "")
+            
+            tokens1 = clip.tokenize(text1)
+            cond1, pooled1 = clip.encode_from_tokens(tokens1, return_pooled=True)
+            
+            tokens2 = clip.tokenize(text2)
+            cond2, pooled2 = clip.encode_from_tokens(tokens2, return_pooled=True)
+            
+            # Simple 50/50 average
+            cond_avg = cond1 * 0.5 + cond2 * 0.5
+            
+            cond_high = [[cond_avg, {
+                "concat_latent_image": concat_latent_image_high, 
+                "concat_mask": mask_high_reshaped}]]
+            cond_low = [[cond_avg, {
+                "concat_latent_image": concat_latent_image_low, 
+                "concat_mask": mask_low_reshaped}]]
+                
+            positive_high_chunks.extend(cond_high)
+            positive_low_chunks.extend(cond_low)
+            
+        else:
+            # temporal_mask (high VRAM)
+            for i, prompt_dict in enumerate(seg_prompts):
+                text = prompt_dict.get("text", "")
+                tokens = clip.tokenize(text)
+                cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+                
+                t_mask = cls._build_temporal_mask(i, aligned_positions, latent_t, H_latent, W_latent, curves_list, device)
+                t_mask = t_mask.unsqueeze(0)
+                
+                cond_high = [[cond, {
+                    "mask": t_mask.clone(), 
+                    "concat_latent_image": concat_latent_image_high, 
+                    "concat_mask": mask_high_reshaped}]]
+                    
+                cond_low = [[cond, {
+                    "mask": t_mask.clone(), 
+                    "concat_latent_image": concat_latent_image_low, 
+                    "concat_mask": mask_low_reshaped}]]
+                    
+                positive_high_chunks.extend(cond_high)
+                positive_low_chunks.extend(cond_low)
             
         return positive_high_chunks, positive_low_chunks, negative_out, {"samples": latent}
 
