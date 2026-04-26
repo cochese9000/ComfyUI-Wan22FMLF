@@ -18,6 +18,8 @@ from comfy_api.latest import ComfyExtension
 from .wan_first_middle_last import WanFirstMiddleLastFrameToVideo
 from .wan_multi_frame import WanMultiFrameRefToVideo
 from .wan_multi_image_loader import WanMultiImageLoader
+from .wan_multi_frame_prompts import WanPromptBatchNode, WanMultiFramePromptToVideo
+from .wan_segmented_generator import WanSegmentedGenerator
 
 WEB_DIRECTORY = "./js"
 
@@ -55,6 +57,9 @@ class WanVideoExtension(ComfyExtension):
             WanFirstMiddleLastFrameToVideo,
             WanMultiFrameRefToVideo,
             WanMultiImageLoader,
+            WanPromptBatchNode,
+            WanMultiFramePromptToVideo,
+            WanSegmentedGenerator,
         ]
         
         if HAS_4FRAME:
